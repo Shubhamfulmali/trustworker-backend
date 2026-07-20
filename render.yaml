@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: trustworker-backend
+    env: node
+    plan: free
+    branch: main
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: ADMIN_API_KEY
+        value: ""
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_BASE64
+        value: ""
+        sync: false
+    autoDeploy: true
+    healthCheckPath: /
