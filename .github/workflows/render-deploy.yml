@@ -1,0 +1,139 @@
+name: Deploy to Render
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  render-deploy:
+    runs-on: ubuntu-latest
+    env:
+      RENDER_API_BASE: https://api.render.com/v1
+      RENDER_SERVICE_NAME: trustworker-backend
+      RENDER_REPO: https://github.com/Shubhamfulmali/trustworker-backend
+      RENDER_BRANCH: main
+      RENDER_TYPE: web_service
+      RENDER_BUILD_COMMAND: npm install
+      RENDER_START_COMMAND: npm start
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure service exists on Render
+        id: find_service
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
+          RENDER_OWNER_ID: ${{ secrets.RENDER_OWNER_ID }}
+          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+          FIREBASE_SERVICE_ACCOUNT_BASE64: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_BASE64 }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${RENDER_SERVICE_ID:-}" ]]; then
+            echo "Found service ID from secret."
+            echo "service_id=${RENDER_SERVICE_ID}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ -z "${RENDER_API_KEY:-}" ]]; then
+            echo "RENDER_API_KEY is required for Render deployment."
+            exit 1
+          fi
+
+          echo "Looking for an existing Render service named '$RENDER_SERVICE_NAME'..."
+          services=$(curl -sS -X GET "$RENDER_API_BASE/services?limit=100" \
+            -H "Authorization: Bearer $RENDER_API_KEY" \
+            -H "Accept: application/json")
+          service_id=$(echo "$services" | jq -r --arg name "$RENDER_SERVICE_NAME" '.[] | select(.name == $name) | .id' | head -n 1)
+
+          if [[ -n "$service_id" && "$service_id" != "null" ]]; then
+            echo "Found existing service: $service_id"
+            echo "service_id=$service_id" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "No existing service found. Creating a new Render service..."
+
+          if [[ -n "${RENDER_OWNER_ID:-}" ]]; then
+            owner_id="$RENDER_OWNER_ID"
+          else
+            owners=$(curl -sS -X GET "$RENDER_API_BASE/owners" \
+              -H "Authorization: Bearer $RENDER_API_KEY" \
+              -H "Accept: application/json")
+            owner_id=$(echo "$owners" | jq -r '.[0].id')
+          fi
+
+          if [[ -z "${owner_id:-}" || "$owner_id" == "null" ]]; then
+            echo "Unable to determine Render workspace owner ID. Please set RENDER_OWNER_ID secret or verify your API key has access."
+            exit 1
+          fi
+
+          payload=$(jq -n \
+            --arg type "$RENDER_TYPE" \
+            --arg name "$RENDER_SERVICE_NAME" \
+            --arg ownerId "$owner_id" \
+            --arg repo "$RENDER_REPO" \
+            --arg branch "$RENDER_BRANCH" \
+            --arg buildCommand "$RENDER_BUILD_COMMAND" \
+            --arg startCommand "$RENDER_START_COMMAND" \
+            '{type:$type, name:$name, ownerId:$ownerId, repo:$repo, branch:$branch, autoDeploy:"yes", serviceDetails:{webServiceDetails:{buildCommand:$buildCommand, startCommand:$startCommand}}}')
+
+          create_response=$(curl -sS -X POST "$RENDER_API_BASE/services" \
+            -H "Authorization: Bearer $RENDER_API_KEY" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            -d "$payload")
+
+          service_id=$(echo "$create_response" | jq -r '.service.id')
+          if [[ -z "$service_id" || "$service_id" == "null" ]]; then
+            echo "Failed to create Render service. Response: $create_response"
+            exit 1
+          fi
+
+          echo "Created Render service: $service_id"
+          echo "service_id=$service_id" >> "$GITHUB_OUTPUT"
+
+      - name: Update Render environment variables
+        if: steps.find_service.outputs.service_id != ''
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+          FIREBASE_SERVICE_ACCOUNT_BASE64: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_BASE64 }}
+        run: |
+          set -euo pipefail
+          service_id=${{ steps.find_service.outputs.service_id }}
+          env_vars='[]'
+
+          if [[ -n "${ADMIN_API_KEY:-}" ]]; then
+            env_vars=$(jq --arg key "ADMIN_API_KEY" --arg value "$ADMIN_API_KEY" '. + [{key:$key, value:$value}]' <<< "$env_vars")
+          fi
+          if [[ -n "${FIREBASE_SERVICE_ACCOUNT_BASE64:-}" ]]; then
+            env_vars=$(jq --arg key "FIREBASE_SERVICE_ACCOUNT_BASE64" --arg value "$FIREBASE_SERVICE_ACCOUNT_BASE64" '. + [{key:$key, value:$value}]' <<< "$env_vars")
+          fi
+
+          if [[ $(jq 'length' <<< "$env_vars") -gt 0 ]]; then
+            payload=$(jq -n --argjson envVars "$env_vars" '{envVars: $envVars}')
+            curl -sS -X PUT "$RENDER_API_BASE/services/$service_id/env-vars" \
+              -H "Authorization: Bearer $RENDER_API_KEY" \
+              -H "Accept: application/json" \
+              -H "Content-Type: application/json" \
+              -d "$payload"
+            echo "Updated Render environment variables for service $service_id"
+          else
+            echo "No Render environment variables to update."
+          fi
+
+      - name: Trigger a deploy on Render
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+        run: |
+          set -euo pipefail
+          service_id=${{ steps.find_service.outputs.service_id }}
+          deploy_response=$(curl -sS -X POST "$RENDER_API_BASE/services/$service_id/deploys" \
+            -H "Authorization: Bearer $RENDER_API_KEY" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            -d '{}')
+          echo "Render deploy triggered for service $service_id"
+          echo "$deploy_response"
